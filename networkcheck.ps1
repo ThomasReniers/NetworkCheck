@@ -651,11 +651,11 @@ function Ensure-Container([string]$ReportsPath,[string]$ImageId) {
         $noNewPrivileges = @($container.HostConfig.SecurityOpt | Where-Object { $_ -in @('no-new-privileges:true','no-new-privileges=true','no-new-privileges') }).Count -gt 0
         $unexpectedMounts = @($container.Mounts | Where-Object { $_.Destination -ne '/reports' -and -not ($_.Type -eq 'tmpfs' -and $_.Destination -eq '/tmp') })
         $policyOK = ($container.Config.Labels.'org.networkcheck.renderer-policy' -eq '2' -and $container.HostConfig.NetworkMode -eq 'none' -and $container.HostConfig.ReadonlyRootfs -and $container.HostConfig.LogConfig.Type -eq 'none' -and $container.Config.User -eq '65532:65532' -and @($container.HostConfig.CapDrop) -contains 'ALL' -and -not $container.HostConfig.CapAdd -and $noNewPrivileges -and -not $container.HostConfig.Privileged -and $unexpectedMounts.Count -eq 0)
-        if ($container.Image -eq $ImageId -and $container.Config.Labels.'org.networkcheck.reportspath' -ieq $ReportsPath -and $sameSource -and $policyOK) { return }
+        if ($container.Image -eq $ImageId -and $container.Config.Image -eq 'networkcheck:latest' -and $container.Config.Labels.'org.networkcheck.reportspath' -ieq $ReportsPath -and $sameSource -and $policyOK) { return }
         [void](Docker-Text @('rm','networkcheck'))
     } elseif ($inspection.stderr -notmatch 'No such (object|container)') { throw ('Cannot inspect networkcheck container: ' + (S $inspection.stderr)) }
     $mount = 'type=bind,source={0},target=/reports,readonly' -f $ReportsPath
-    [void](Docker-Text @('create','--name','networkcheck','--label','org.networkcheck.managed=true','--label','org.networkcheck.renderer-policy=2','--label',('org.networkcheck.reportspath=' + $ReportsPath),'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges=true','--user','65532:65532','--log-driver','none','--pids-limit','64','--memory','256m','--cpus','1','--tmpfs','/tmp:rw,noexec,nosuid,size=32m','--mount',$mount,$ImageId))
+    [void](Docker-Text @('create','--name','networkcheck','--label','org.networkcheck.managed=true','--label','org.networkcheck.renderer-policy=2','--label',('org.networkcheck.reportspath=' + $ReportsPath),'--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges=true','--user','65532:65532','--log-driver','none','--pids-limit','64','--memory','256m','--cpus','1','--tmpfs','/tmp:rw,noexec,nosuid,size=32m','--mount',$mount,'networkcheck:latest'))
 }
 function Help {
 @'
@@ -754,7 +754,15 @@ try {
                 catch { [Console]::Error.WriteLine(('NETWORKCHECK - WARNING: Could not confirm container stopped: ' + (S $_.Exception.Message))) }
             }
         } finally {
-            if ($locked) { Remove-Item -LiteralPath $tempFile -ErrorAction SilentlyContinue; [void]$mutex.ReleaseMutex() }
+            if ($locked) {
+                Remove-Item -LiteralPath $tempFile -ErrorAction SilentlyContinue
+                # The Docker bind mount is stopped before cleanup. Remove only an empty
+                # staging directory; never recursively delete unexpected user files.
+                if (Test-Path -LiteralPath $workPath -PathType Container) {
+                    Remove-Item -LiteralPath $workPath -ErrorAction SilentlyContinue
+                }
+                [void]$mutex.ReleaseMutex()
+            }
             $mutex.Dispose()
         }
     }
