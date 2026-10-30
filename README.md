@@ -14,14 +14,14 @@ The launcher is included beside the script. It also supports the existing siblin
 
 ```text
 NetworkCheck/
-    ├── Dockerfile
-    ├── networkcheck.ps1
-    ├── .dockerignore
-    ├── .gitignore
-    ├── README.md
-    ├── REVIEW.md
-    └── reports/
-        └── .gitkeep
+├── Dockerfile
+├── networkcheck.ps1
+├── .dockerignore
+├── .gitignore
+├── README.md
+├── REVIEW.md
+└── reports/
+    └── .gitkeep
 ```
 
 Build from `DockerProjects/NetworkCheck` (one time, and after source changes):
