@@ -1,0 +1,4 @@
+# Only the renderer source belongs in the build context.
+*
+!Dockerfile
+!networkcheck.ps1
