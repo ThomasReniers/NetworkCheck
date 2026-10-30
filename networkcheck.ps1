@@ -45,20 +45,21 @@ function Is-Admin {
         return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     } catch { return $false }
 }
-function Read-Cmdlet([string]$Name, [scriptblock]$Action, [System.Collections.ArrayList]$Notes, $Checks) {
+function Read-Cmdlet([string]$Name, [scriptblock]$Action, [System.Collections.ArrayList]$Notes, $Checks, [string]$CheckName='') {
+    if (-not $CheckName) { $CheckName=$Name }
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         [void]$Notes.Add("$Name is unavailable on this Windows installation.")
-        Set-Check $Checks $Name 'UNAVAILABLE' 'Command unavailable.'
+        Set-Check $Checks $CheckName 'UNAVAILABLE' 'Command unavailable.'
         return $null
     }
     try {
         # Buffer results so a failed query cannot leak partial data as a successful check.
         $result = @(& $Action)
-        Set-Check $Checks $Name 'OK'
+        Set-Check $Checks $CheckName 'OK'
         return $result
     } catch {
-        Set-Check $Checks $Name 'FAILED' $_.Exception.Message
-        [void]$Notes.Add(("{0} could not be read: {1}" -f $Name, (S $_.Exception.Message)))
+        Set-Check $Checks $CheckName 'FAILED' $_.Exception.Message
+        [void]$Notes.Add(("{0} could not be read: {1}" -f $CheckName, (S $_.Exception.Message)))
         return $null
     }
 }
@@ -115,6 +116,221 @@ function Tcp-One([string]$HostName, [int]$Port, [int]$TimeoutMs=3500) {
         } finally { $ar.AsyncWaitHandle.Close() }
     } catch { return [ordered]@{ succeeded=$false; detail=(S $_.Exception.Message) } }
     finally { $c.Close(); $c.Dispose() }
+}
+function Get-IdentityTime($Value) {
+    if ($null -eq $Value) { return $null }
+    try { return ([DateTimeOffset]$Value).ToUniversalTime() } catch { return $null }
+}
+function New-ListenerIdentity([string]$Reason) {
+    return [ordered]@{
+        process='unknown'; executable=$null; started=$null
+        process_identification=[ordered]@{ status='not_identified'; evidence=$Reason }
+        services=@()
+        service_identification=[ordered]@{ status='not_identified'; evidence=$Reason }
+        application=[ordered]@{ name=$null; status='not_identified'; source=$null; scope='process_executable'; evidence=$Reason }
+        device=[ordered]@{ name=$null; type=$null; status='not_identified'; source=$null; evidence='No direct device-to-listener ownership evidence is available. Configured remote printer endpoints and outbound connections do not identify a local listener.' }
+        identification_notes=@($Reason)
+    }
+}
+function Get-ExecutableMetadata([string]$ExecutablePath) {
+    # Read version resources, never load/run the binary. Reject network paths, mapped
+    # network drives and reparse points so metadata lookup does not contact remote devices.
+    if ($ExecutablePath -notmatch '^[A-Za-z]:[\\/]' -or $ExecutablePath -match '[\x00-\x1F]') {
+        return [ordered]@{ product=''; description=''; detail='Executable metadata unavailable: no ordinary local executable path.' }
+    }
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        return [ordered]@{ product=''; description=''; detail='Use 64-bit PowerShell for executable metadata on 64-bit Windows; filesystem redirection can otherwise identify a different binary.' }
+    }
+    try {
+        $fullPath=[IO.Path]::GetFullPath($ExecutablePath)
+        $drive=New-Object System.IO.DriveInfo([IO.Path]::GetPathRoot($fullPath))
+        if ($drive.DriveType -notin @('Fixed','Removable','CDRom','Ram')) { throw 'Non-local drive.' }
+        $cursor=$fullPath
+        while ($cursor) {
+            $entry=Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Reparse point.' }
+            $parent=[IO.Path]::GetDirectoryName($cursor)
+            if ($parent -eq $cursor) { break }
+            $cursor=$parent
+        }
+        $version=[Diagnostics.FileVersionInfo]::GetVersionInfo($fullPath)
+        return [ordered]@{ product=(S $version.ProductName).Trim(); description=(S $version.FileDescription).Trim(); detail='' }
+    } catch {
+        return [ordered]@{ product=''; description=''; detail='Executable metadata unavailable (permissions, file removal, or a non-local/reparse path).' }
+    }
+}
+function Read-ApplicationRegistrations($Notes,$Checks) {
+    # Do not use Win32_Product: its provider can trigger Windows Installer repairs.
+    $locations=@(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    $records=New-Object System.Collections.ArrayList
+    $incomplete=$false
+    foreach ($location in $locations) {
+        try {
+            if (-not (Test-Path -LiteralPath $location -ErrorAction Stop)) { continue }
+            $keys=@(Get-ChildItem -LiteralPath $location -ErrorAction Stop)
+            foreach ($key in $keys) {
+                try {
+                    # Do not read uninstall commands, product codes or license keys.
+                    $name=(S $key.GetValue('DisplayName')).Trim()
+                    $installLocation=[string]$key.GetValue('InstallLocation')
+                    $installLocation=[Environment]::ExpandEnvironmentVariables($installLocation).Trim().Trim('"')
+                    if (-not $name -or $installLocation -notmatch '^[A-Za-z]:[\\/]') { continue }
+                    $installLocation=[IO.Path]::GetFullPath($installLocation).TrimEnd('\','/')
+                    if ($installLocation.Length -le 3) { continue }
+                    # Common platform roots do not identify an individual application.
+                    $commonRoots=@($env:ProgramFiles,${env:ProgramFiles(x86)},$env:ProgramData,$env:windir) | Where-Object { $_ }
+                    if (@($commonRoots | Where-Object { $_.TrimEnd('\','/') -ieq $installLocation }).Count) { continue }
+                    [void]$records.Add([ordered]@{ name=$name; location=$installLocation })
+                } catch { $incomplete=$true }
+                finally { if ($key -is [IDisposable]) { $key.Dispose() } }
+            }
+        } catch { $incomplete=$true }
+    }
+    if ($incomplete) {
+        Set-Check $Checks 'Listener application registrations' 'INCOMPLETE' 'Some installation registrations could not be read.'
+        [void]$Notes.Add('Some application registrations were inaccessible; application identification may be incomplete.')
+    } else { Set-Check $Checks 'Listener application registrations' 'OK' }
+    return $records.ToArray()
+}
+function Find-RegisteredApplication([string]$ExecutablePath,[object[]]$Registrations) {
+    $matches=@($Registrations | Where-Object {
+        $_.location -and $ExecutablePath.StartsWith(($_.location.TrimEnd('\','/') + '\'),[StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($matches.Count -eq 0) { return $null }
+    $longest=($matches | ForEach-Object { $_.location.Length } | Measure-Object -Maximum).Maximum
+    $names=@($matches | Where-Object { $_.location.Length -eq $longest } | ForEach-Object { S $_.name } | Sort-Object -Unique)
+    # A directory match is only a possible association. Never choose between tied products.
+    if ($names.Count -ne 1) { return $null }
+    return [ordered]@{ name=$names[0]; status='possible'; source='installation_registration'; scope='process_executable'; evidence='A unique most-specific InstallLocation contains this executable. Directory membership does not prove product ownership.' }
+}
+function Get-ProcessListenerIdentity([int]$OwnerId,$CimProcess,[object[]]$Services,[string]$ServiceStatus,$Context) {
+    $identity=New-ListenerIdentity 'Process details were not identified.'
+    if ($OwnerId -le 0) {
+        $identity.identification_notes=@('PID 0 is not treated as an application or matched to stopped services.')
+        return $identity
+    }
+    $process=$null; $path=''; $current=$false; $ended=$false
+    try {
+        $process=Get-Process -Id $OwnerId -ErrorAction Stop
+        if ($process.Id -ne $OwnerId) { throw 'Process ID changed.' }
+        if ($process.HasExited) { $ended=$true; throw 'Process ended.' }
+        $identity.process=S $process.ProcessName
+        $identity.executable=$identity.process
+        $identity.process_identification=[ordered]@{ status='confirmed'; evidence='Get-Process returned the listening process ID.' }
+        $current=$true
+        try { $identity.started=Get-IdentityTime $process.StartTime } catch { }
+        try { $path=[string]$process.Path } catch { }
+    } catch {
+        if ($_.FullyQualifiedErrorId -match 'NoProcessFoundForGivenId') { $ended=$true }
+        $identity.process_identification=[ordered]@{ status='unavailable'; evidence='The process ended or its details could not be accessed.' }
+    } finally { if ($process -is [IDisposable]) { $process.Dispose() } }
+    $identity.identification_notes=@()
+    if ($ended) { return (New-ListenerIdentity 'The process ended during collection; earlier PID associations were discarded.') }
+    if (-not $current) { $identity.identification_notes+= 'Process details unavailable (limited permissions or process termination).' }
+
+    $cimTime=$null; $cimMatches=$false
+    if ($CimProcess -and $current) {
+        $cimTime=Get-IdentityTime $CimProcess.CreationDate
+        $sameName=($CimProcess.Name -and [IO.Path]::GetFileNameWithoutExtension([string]$CimProcess.Name) -ieq $identity.process)
+        if (($CimProcess.Name -and -not $sameName) -or ($identity.started -and $cimTime -and [Math]::Abs(($identity.started - $cimTime).TotalSeconds) -gt 1)) {
+            return (New-ListenerIdentity 'Process snapshots disagree; a reused PID or process change prevents reliable identification.')
+        }
+        $cimMatches=($sameName -and $null -ne $identity.started -and $null -ne $cimTime)
+        if (-not $path -and $cimMatches) { $path=[string]$CimProcess.ExecutablePath }
+        if ($CimProcess.Name) { $identity.executable=S $CimProcess.Name }
+    }
+    $matches=@($Services | Where-Object {
+        $null -ne $_ -and $_.ProcessId -gt 0 -and $_.ProcessId -eq $OwnerId -and $_.Name -and
+        $_.State -in @('Running','Paused','Start Pending','Stop Pending','Continue Pending','Pause Pending')
+    } | Sort-Object Name,DisplayName -Unique)
+    $shared=($matches.Count -gt 1)
+    foreach ($service in $matches) {
+        $status=if ($current -and -not $shared -and $ServiceStatus -eq 'OK') { 'confirmed' } else { 'possible' }
+        $identity.services+= [ordered]@{ name=(S $service.Name); display_name=(S $service.DisplayName); status=$status; evidence='Win32_Service.ProcessId matches the local listener OwningProcess. This establishes process membership, not socket-specific service ownership.' }
+    }
+    if ($matches.Count) {
+        $status=if ($current -and -not $shared -and $ServiceStatus -eq 'OK') { 'confirmed' } else { 'possible' }
+        $identity.service_identification=[ordered]@{ status=$status; evidence='Services are associated with the owning process by PID; exact attribution of a socket to a hosted service is not available.' }
+        if ($shared) { $identity.identification_notes+='Shared process: the service responsible for this particular port cannot be determined.' }
+    } elseif ($ServiceStatus -eq 'OK' -and $current) {
+        $identity.service_identification=[ordered]@{ status='not_applicable'; evidence='No active Windows service in the snapshot has this process ID.' }
+    } else {
+        $identity.service_identification=[ordered]@{ status='unavailable'; evidence='Service ownership could not be determined from the available snapshots.' }
+    }
+    if ($ServiceStatus -ne 'OK') { $identity.identification_notes+='Windows service inventory unavailable or incomplete.' }
+    if (-not $current) { return $identity }
+    if (-not $identity.started) { $identity.identification_notes+='Process start time unavailable; PID reuse cannot be checked for this process.' }
+    if ($path) {
+        $identity.executable=S ([IO.Path]::GetFileName($path))
+        if (-not $Context.metadata.ContainsKey($path)) { $Context.metadata[$path]=Get-ExecutableMetadata $path }
+        $metadata=$Context.metadata[$path]
+        if ($metadata.product) {
+            $identity.application=[ordered]@{ name=(S $metadata.product); status='confirmed'; source='executable_product_name'; scope='process_executable'; evidence='ProductName read from the owning executable version resource. This is self-reported metadata, not a verified publisher or a hosted-service product.' }
+        } else {
+            if ($metadata.detail) { $identity.identification_notes+=S $metadata.detail }
+            # Only inspect registrations for an ordinary local path that passed metadata access.
+            if (-not $metadata.detail) {
+                if (-not $Context.registrations_loaded) {
+                    $Context.registrations=@(Read-ApplicationRegistrations $Context.notes $Context.checks)
+                    $Context.registrations_loaded=$true
+                }
+                $registered=Find-RegisteredApplication $path $Context.registrations
+                if ($registered) { $identity.application=$registered }
+                elseif ($metadata.description) {
+                    $identity.application=[ordered]@{ name=(S $metadata.description); status='possible'; source='executable_description'; scope='process_executable'; evidence='FileDescription identifies the executable description; it does not establish an application product name.' }
+                }
+            }
+        }
+    } else { $identity.identification_notes+='Executable path unavailable; application product not identified.' }
+    return $identity
+}
+function Get-ListenerInventory([object[]]$Connections,$Notes,$Checks) {
+    if (@($Connections | Where-Object { $null -ne $_ }).Count -eq 0) { return @() }
+    $services=@(Read-Cmdlet 'Get-CimInstance' { Get-CimInstance -ClassName Win32_Service -Property ProcessId,Name,DisplayName,State -OperationTimeoutSec 10 -ErrorAction Stop } $Notes $Checks 'Listener services')
+    $processes=@(Read-Cmdlet 'Get-CimInstance' { Get-CimInstance -ClassName Win32_Process -Property ProcessId,Name,ExecutablePath,CreationDate -OperationTimeoutSec 10 -ErrorAction Stop } $Notes $Checks 'Listener processes')
+    $byProcess=@{}; $byService=@{}; $identities=@{}
+    foreach ($process in $processes) {
+        if ($null -ne $process -and $process.ProcessId -gt 0) {
+            $byProcess[[int]$process.ProcessId]=$process
+            if (-not $process.Name -or $null -eq $process.CreationDate) { Set-Check $Checks 'Listener processes' 'INCOMPLETE' 'A process snapshot lacked its name or creation time.' }
+        }
+    }
+    foreach ($service in $services) {
+        if ($null -eq $service -or $service.ProcessId -le 0) { continue }
+        if (-not $service.Name -or -not $service.State) { Set-Check $Checks 'Listener services' 'INCOMPLETE' 'An active service snapshot lacked its name or state.' }
+        $owner=[int]$service.ProcessId
+        if (-not $byService.ContainsKey($owner)) { $byService[$owner]=@() }
+        $byService[$owner]+=$service
+    }
+    $context=@{ metadata=@{}; registrations=@(); registrations_loaded=$false; notes=$Notes; checks=$Checks }
+    foreach ($connection in ($Connections | Where-Object { $null -ne $_ } | Sort-Object LocalPort,LocalAddress,OwningProcess -Unique)) {
+        $owner=[int]$connection.OwningProcess
+        if (-not $identities.ContainsKey($owner)) {
+            try { $identities[$owner]=Get-ProcessListenerIdentity $owner $byProcess[$owner] @($byService[$owner]) $Checks['Listener services'].status $context }
+            catch {
+                $identities[$owner]=New-ListenerIdentity 'Identification could not be completed for this process; the local listener is still included.'
+                Set-Check $Checks 'Listener identification' 'INCOMPLETE' 'An individual process could not be identified.'
+            }
+        }
+        $identity=$identities[$owner]
+        $created=Get-IdentityTime $connection.CreationTime
+        if ($created -and $identity.started -and $identity.started -gt $created.AddSeconds(1)) {
+            $identity=New-ListenerIdentity 'The current process started after this listener; PID reuse prevents reliable identification.'
+        }
+        [ordered]@{
+            address=(S $connection.LocalAddress); port=[int]$connection.LocalPort; process=$identity.process; pid=$owner
+            all_interfaces=(@('0.0.0.0','::') -contains (S $connection.LocalAddress))
+            executable=$identity.executable; process_identification=$identity.process_identification
+            services=@($identity.services); service_identification=$identity.service_identification
+            application=$identity.application; device=$identity.device
+            identification_notes=@($identity.identification_notes | Select-Object -Unique)
+        }
+    }
 }
 function Get-LocalReport([string]$Target,[int]$Port) {
     $notes = New-Object System.Collections.ArrayList
@@ -207,12 +423,8 @@ function Get-LocalReport([string]$Target,[int]$Port) {
     $rdpPort = Read-RegistryValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'PortNumber' 'RDP port' $notes $checks
     if ($null -eq $rdpPort -or $rdpPort -lt 1 -or $rdpPort -gt 65535) { if ($checks['RDP port'].status -eq 'OK') { Set-Check $checks 'RDP port' 'INCOMPLETE' 'RDP listener port missing or invalid.' }; $rdpPort=$null }
 
-    $listen = @(); $rawListen = @(Read-Cmdlet 'Get-NetTCPConnection' { Get-NetTCPConnection -State Listen -ErrorAction Stop } $notes $checks)
-    foreach ($c in ($rawListen | Where-Object { $null -ne $_ } | Sort-Object LocalPort,LocalAddress,OwningProcess -Unique)) {
-        $name = ''
-        try { $p = Get-Process -Id $c.OwningProcess -ErrorAction Stop; $name = S $p.ProcessName } catch { $name = 'unknown' }
-        $listen += [ordered]@{ address=(S $c.LocalAddress); port=[int]$c.LocalPort; process=$name; pid=[int]$c.OwningProcess; all_interfaces=(@('0.0.0.0','::') -contains (S $c.LocalAddress)) }
-    }
+    $rawListen = @(Read-Cmdlet 'Get-NetTCPConnection' { Get-NetTCPConnection -State Listen -ErrorAction Stop } $notes $checks)
+    $listen = @(Get-ListenerInventory $rawListen $notes $checks)
     $ports = @($listen | Where-Object { $_.address -ne '::1' -and $_.address -notmatch '^127\.' })
     if ($rdpEnabled -eq $true) {
         $rdpListeners = @($listen | Where-Object { $null -ne $rdpPort -and $_.port -eq $rdpPort })
@@ -238,7 +450,7 @@ function Get-LocalReport([string]$Target,[int]$Port) {
     $networkComplete = @(@('Get-NetAdapter','Get-NetIPConfiguration','Get-NetRoute') | Where-Object { $checks[$_].status -ne 'OK' }).Count -eq 0
     if (-not $networkComplete -and $networkStatus -eq 'OK') { $networkStatus = 'INCONCLUSIVE' }
     return [ordered]@{
-        schema_version=2
+        schema_version=3
         source=[ordered]@{ computer=(S $env:COMPUTERNAME); os=$(if ($os) { S $os.Caption } else { 'Windows' }); timestamp=$now.ToString('o'); elevated=$admin; scanner='Windows PowerShell (read-only)' }
         target=[ordered]@{ hostname=$Target; port=$Port }
         summary=[ordered]@{ connectivity=$networkStatus; security=$securityStatus; adapters=$activeAdapters.Count; listening_ports=$listen.Count; network_issues=@($issues | Where-Object { $_.category -eq 'NETWORK' }).Count; security_findings=@($issues | Where-Object { $_.category -eq 'SECURITY' }).Count; connectivity_complete=$networkComplete; security_complete=$securityComplete }
@@ -298,7 +510,34 @@ function As-Lines($report) {
     Add-ReportHeading '3. LISTENING PORTS'
     Add-ReportLine ('  Found {0} local TCP listeners:' -f @($report.listeners).Count)
     if (@($report.listeners).Count -eq 0) { Add-ReportLine '  No listening TCP ports found or query unavailable.' }
-    foreach ($item in $report.listeners) { Add-ReportLine ('  {0,-23} TCP {1,-5}  {2} (PID {3})' -f $item.address,$item.port,$item.process,$item.pid) }
+    foreach ($item in $report.listeners) {
+        Add-ReportLine ''
+        Add-ReportLine ('  Address     : {0}' -f $item.address)
+        Add-ReportLine ('  Port        : {0} (TCP)' -f $item.port)
+        $processName=if ($item.executable) { $item.executable } elseif ($item.process -and $item.process -ne 'unknown') { $item.process } else { 'Not identified' }
+        Add-ReportLine ('  Process     : {0} (PID {1})' -f $processName,$item.pid)
+        if (@($item.services).Count -gt 0 -and $null -ne $item.services) {
+            $first=$true
+            foreach ($service in $item.services) {
+                $serviceName=if ($service.display_name) { '{0} ({1})' -f $service.display_name,$service.name } else { $service.name }
+                if ($item.service_identification.status -eq 'possible' -and @($item.services).Count -eq 1) { $serviceName+=' (possible)' }
+                Add-ReportLine ('  {0} {1}' -f $(if ($first) { 'Service     :' } else { '             ' }),$serviceName)
+                $first=$false
+            }
+        } else {
+            Add-ReportLine ('  Service     : {0}' -f $(if ($item.service_identification.status -eq 'not_applicable') { 'N/A' } else { 'Not identified' }))
+        }
+        $applicationName=if ($item.application.name) { [string]$item.application.name } else { 'Not identified' }
+        if ($item.application.name -and $item.application.status -eq 'possible') { $applicationName+=' (possible)' }
+        if ($item.application.name -and @($item.services).Count -gt 0 -and $null -ne $item.services) { $applicationName+=' (host executable product)' }
+        Add-ReportLine ('  Application : {0}' -f $applicationName)
+        $deviceName='N/A'
+        if ($item.device.name -and $item.device.status -eq 'confirmed') {
+            $deviceName=if ($item.device.type) { '{0}: {1}' -f $item.device.type,$item.device.name } else { $item.device.name }
+        }
+        Add-ReportLine ('  Device      : {0}' -f $deviceName)
+        foreach ($note in $item.identification_notes) { Add-ReportLine ('  Note        : {0}' -f $note) }
+    }
     Add-ReportHeading '4. SECURITY & VULNERABILITY CHECKS'
     if (@($report.security.firewall).Count -gt 0) { foreach ($f in $report.security.firewall) { Add-ReportLine ('  Firewall {0,-8}: {1}' -f $f.profile,$(if ($null -eq $f.enabled) { 'unknown' } elseif ($f.enabled) { 'enabled' } else { 'DISABLED' })) } }
     else { Add-ReportLine '  Firewall         : not available' }

@@ -8,29 +8,29 @@ NetworkCheck helps distinguish connectivity problems from potential security exp
 
 ## Quick start (Windows + Docker Desktop)
 
-Requirements: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7, and Docker Desktop set to Linux containers. Add the project folder (or an existing sibling `Batchfiles` folder) to your `PATH`.
+Requirements: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7, and Docker Desktop set to Linux containers. Add the project folder to your `PATH`.
 
 The launcher is included beside the script. It also supports the existing sibling layout:
 
 ```text
-NetworkCheck/
+/NetworkCheck/
 ├── Dockerfile
 ├── networkcheck.ps1
 ├── .dockerignore
 ├── .gitignore
 ├── README.md
-├── REVIEW.md
 └── reports/
     └── .gitkeep
 ```
 
-Build from `DockerProjects/NetworkCheck` (one time, and after source changes):
+Build from `/NetworkCheck/` folder (one time, and after source changes):
 
 ```powershell
 docker build --no-cache -t networkcheck:latest .
 ```
 
-Keep `networkcheck.bat` beside `networkcheck.ps1` and add that folder to your `PATH`, or copy the launcher into the existing sibling `DockerProjects/Batchfiles` folder. It finds the script relative to its own location and propagates the script's exit code.
+Keep `networkcheck.bat` beside `networkcheck.ps1` and add that folder to your `PATH`, or copy the launcher into a sibling folder in the same location as '/NetworkCheck/' and add that folder to your 'PATH'.
+It finds the script relative to its own location and propagates the script's exit code.
 
 Close/reopen the terminal, then run from **any directory**:
 
@@ -54,13 +54,25 @@ Output files are placed in `NetworkCheck/reports` using timestamped names. Witho
 |---|---|
 | Network interfaces | Active and inactive adapters, IPv4/IPv6 addresses, gateways, configured DNS servers, active IPv4/IPv6 routing table |
 | Connectivity | Advisory ICMP reply from one gateway, bounded target name resolution, one TCP connection to the first resolved address |
-| Local services | Listening TCP ports, process names where available (no external port scan) |
+| Local services | Listening TCP ports, executable/PID, associated Windows services, application metadata and explicit device-identification status (no external port scan) |
 | Windows Firewall | Domain/Private/Public profile configuration |
 | SMB | SMBv1 server configuration, whether client/server signing is required |
 | Name resolution | LLMNR policy setting |
 | Remote access | RDP enablement, RemoteRegistry service, potentially sensitive listening ports |
 
 All findings include severity, confidence, concrete evidence, an explanation and non-destructive troubleshooting suggestions. `HIGH` confidence means a configuration or test result was directly observed; `MEDIUM` means the risk interpretation is indirect (for example, a conventional service port or an unconfigured LLMNR policy). Confidence does not measure exploitability. An open local port **does not mean** that the port is accessible from the internet; a security configuration finding **does not identify a CVE**.
+
+### Listener identification
+
+Section `3. LISTENING PORTS` shows aligned Address, Port, Process, Service, Application and Device fields for every listener. Process and executable metadata are cached for repeated sockets. Services are ordered by their internal name; all matching active services are listed when a process hosts several services. PID 0 is never treated as an application or matched to stopped services.
+
+A service association uses the listener's owning PID and the local Windows service snapshot. `confirmed` means the service shares the observed process ID; it does not prove which hosted service owns an individual socket. Shared-process matches are explicitly `possible`. Service inventory failures produce `Not identified`, while a successful query with no matching service produces `N/A`. Process termination, inaccessible properties and observed PID-reuse conflicts retain the listener with an explanatory note.
+
+Application identification prefers the executable's `ProductName` version resource. If absent, a unique most-specific installation-directory registration or a file description can supply a name labelled `possible`. Conflicting registration names are not arbitrarily resolved. The product is associated with the **host executable**, including for shared service hosts; it is not assumed to be the product of every hosted service. Version resources are self-reported, not publisher authentication. See [Microsoft's file version metadata](https://learn.microsoft.com/dotnet/api/system.diagnostics.fileversioninfo) and [installation registry fields](https://learn.microsoft.com/en-us/windows/win32/msi/uninstall-registry-key).
+
+Device identification is deliberately conservative. Current process/service snapshots do not establish which particular device owns a local socket, so Device displays `N/A` and JSON explains `not_identified`. No device names are fabricated. Printer configuration and remote TCP printer endpoints are not treated as local listener ownership, and printer inventory or active device discovery is not performed merely to match a port number.
+
+Identification reads local CIM snapshots and executable version resources without executing discovered programs. Installation registration is read only when needed; `Win32_Product` is not queried because its provider can trigger installer consistency checks and repairs ([Microsoft's explanation](https://learn.microsoft.com/en-us/powershell/scripting/samples/working-with-software-installations)). Command lines, uninstall commands, license keys and full executable/install paths are not added to the report. Network-drive, UNC and reparse paths are skipped for metadata lookup. Protected processes, missing registrations and applications without useful metadata may remain unidentified; administrator privileges are not automatically requested.
 
 ## How to interpret the results
 
@@ -107,30 +119,31 @@ The CLI launches without an execution-policy bypass, and does not change the use
 
 ## Validation
 
-The final development suite passed all 24 checks on Windows PowerShell 5.1.26100.9756 and PowerShell 7.6.9. It covered healthy, problematic and inconclusive synthetic cases, CLI validation, timeout handling, partial failures, legacy reports, complete listener inventory and TXT/Markdown/JSON consistency.
+**Service/application/device extension:** all 23 checks passed on Windows PowerShell 5.1.26100.9756 and PowerShell 7.6.9. Automated cases covered single/shared services, regular applications, PID 0, inaccessible/terminated processes, missing products, printer false-positive prevention, PID reuse, limited permissions, terminal/TXT/Markdown/JSON consistency, legacy reports and existing connectivity/security behavior. A separate local loopback TCP handshake also passed.
 
-Docker integration verified the corrected renderer using a temporary read-only source mount into the user-built image, exact timestamp parity, two runs of the persistent `networkcheck` container, container reuse and shutdown, and temporary-input cleanup. No image was built by the development tests, and no private host assessment or external target probe was performed. A final manual Docker build is required to include the latest source fixes in the image.
+Actual Windows integration validated a Windows-reported listener against an independent process lookup and read product metadata from the current executable. Shared-service cases, printer exclusions and permission failures were validated with synthetic data; these results do not claim integration with every installed service, application or device. No active device discovery or external target probes were used.
 
-The temporary test suite and synthetic fixtures were removed after validation at the owner's request. They are not part of the finalized project.
+Docker integration used the owner-built image on both PowerShell runtimes, compared rendered text and Markdown with the host renderer, and verified two runs reuse the persistent container, stop successfully and delete the temporary input. No image was built automatically. The temporary suite and fixtures were removed after all checks passed, as requested. The owner confirmed the final manual build, and the final project/diff privacy review passed. Git publication requires separate owner approval.
 
-JSON schema version 2 retains existing report fields and adds `routes`, `checks`, finding `confidence`, coverage flags, the tested TCP address and the configured RDP port. `tcp_connected` can now be `null` when DNS failure prevents a connection attempt. `adapters` includes inactive interfaces while `summary.adapters` still counts active interfaces. TXT and Markdown include every collected listener. The renderer still accepts schema 1 reports, with missing confidence shown as legacy data.
+The prior **0.2 baseline** development suite passed all 24 checks on Windows PowerShell 5.1.26100.9756 and PowerShell 7.6.9. It covered healthy, problematic and inconclusive synthetic cases, CLI validation, timeout handling, partial failures, legacy reports, complete listener inventory and TXT/Markdown/JSON consistency.
+
+That prior temporary test suite and its fixtures were also removed after validation at the owner's request.
+
+JSON schema version 3 preserves the existing listener fields (`address`, `port`, `process`, `pid`, `all_interfaces`) and adds `executable`, `process_identification`, a `services` array, `service_identification`, `application`, `device` and `identification_notes`. Identification objects carry explicit status and evidence; application data also records its source and `process_executable` scope. A confirmed device requires direct ownership evidence; the current collector records devices as `not_identified`.
+
+All schema 2 fields remain: `routes`, `checks`, finding `confidence`, coverage flags, the tested TCP address and configured RDP port. `tcp_connected` can be `null` when DNS failure prevents a connection attempt. `adapters` includes inactive interfaces while `summary.adapters` counts active interfaces. TXT and Markdown include every collected listener. The renderer still accepts schema 1 and 2 reports, with unavailable identification displayed as unknown rather than inferred. JSON consumers that strictly validate the version must accept schema 3 before using the new fields.
 
 ## Limitations
 
 - This is one target/address/port test. Other resolved addresses are listed but not contacted; no fallback address, proxy, HTTP, TLS or certificate validation is performed. A failed first address does not imply every address or the internet is unreachable.
 - The Windows system resolver may use cache, the hosts file and configured name-resolution mechanisms. On .NET Framework, a DNS wait can time out while the underlying resolver finishes in the background.
 - Local Windows inventory cmdlets have no enforced process-level deadline. Provider delays may extend total runtime beyond the probe timeouts. Missing permissions, absent modules, process exits and changing configuration can reduce coverage.
+- Listener service/process CIM requests use a 10-second operation timeout each; this is a provider timeout, not a guaranteed whole-scan deadline. Registry and metadata reads can add time. Snapshots are not atomic: creation times reject observed PID-reuse conflicts but cannot rule out every race. The application's resources on disk may also have changed since the process started. Installation-registration fallback covers the machine and current user's standard uninstall registry views, not every package system or other users' registrations.
+- On 64-bit Windows, use 64-bit PowerShell for application metadata. A 32-bit host retains listener/service collection but skips executable metadata to avoid identifying a different binary through filesystem redirection.
 - Firewall profiles are effective profile configuration, not a rule-by-rule reachability analysis or third-party firewall assessment. Route metrics are reported without claiming which route Windows selected for the target. The advisory gateway need not be the route used for that target.
 - SMBv1 assessment covers the server protocol setting, not the installed SMBv1 client optional feature. Signing settings are configuration observations, not captured SMB negotiation.
 - RDP checks local enablement and configured TCP port, not every policy override, authentication setting or actual protocol handshake. LLMNR checks the policy registry value, not runtime traffic. RemoteRegistry service state does not establish remote accessibility.
 - Privacy relies on local filesystem permissions. Reports may contain private information. `.gitignore` and the Docker build-context allowlist prevent normal accidental inclusion, but cannot prevent deliberate sharing. Do not force-add reports to source control.
 - The official PowerShell base image currently uses `latest`; builds are not bit-for-bit reproducible. Image digest pinning and a deliberate update policy remain follow-up work.
-
-## Background documentation
-
-- [Microsoft: SMBv1 configuration](https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3)
-- [Microsoft: SMB signing](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-signing)
-- [Microsoft: LLMNR Group Policy](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-dnsclient)
-- [Microsoft: Get-NetTCPConnection](https://learn.microsoft.com/en-us/powershell/module/nettcpip/get-nettcpconnection)
 
 No third-party Python libraries or package managers are required.
