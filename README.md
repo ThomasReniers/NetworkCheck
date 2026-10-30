@@ -13,7 +13,7 @@ Requirements: Windows 10/11, Windows PowerShell 5.1 or PowerShell 7, and Docker 
 The launcher is included beside the script. It also supports the existing sibling layout:
 
 ```text
-DockerProjects/
+Projects/
 ├── Batchfiles/
 │   └── networkcheck.bat
 └── NetworkCheck/
